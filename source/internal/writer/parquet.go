@@ -23,18 +23,37 @@ type Row = map[string]any
 // WriteBaseParquet writes rows to a base Parquet file using parquet-go.
 // All values are written as strings/bytes for simplicity in v0.1.
 // Downstream consumers (pg-warehouse) handle type coercion via DuckDB's read_parquet.
+//
+// The base schema always carries the nullable __deleted_at tombstone column
+// (btypes.ColDeletedAt). Compaction stamps it on deleted rows; excluding it here
+// would silently drop tombstones when the compacted base is written, so
+// deletes would resurrect on the next read-back and TTL purging could never see
+// them. Delta-only metadata (__op, __epoch) is still filtered out.
 func WriteBaseParquet(path string, rows []Row, columns []manifest.Column) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	// Filter out CDC metadata columns
+	// Filter out delta-only CDC metadata columns, but keep __deleted_at — it
+	// belongs to the base-file contract as the tombstone marker.
 	var dataCols []manifest.Column
+	hasDeletedAt := false
 	for _, col := range columns {
-		if col.Name == btypes.ColOp || col.Name == btypes.ColEpoch || col.Name == btypes.ColDeletedAt {
+		if col.Name == btypes.ColOp || col.Name == btypes.ColEpoch {
 			continue
 		}
+		if col.Name == btypes.ColDeletedAt {
+			hasDeletedAt = true
+		}
 		dataCols = append(dataCols, col)
+	}
+	if !hasDeletedAt {
+		dataCols = append(dataCols, manifest.Column{
+			Name:        btypes.ColDeletedAt,
+			PgType:      "timestamp with time zone",
+			ParquetType: "TIMESTAMP_MICROS",
+			Nullable:    true,
+		})
 	}
 
 	return writeParquetFile(path, rows, dataCols)
@@ -88,6 +107,10 @@ func writeParquetFile(path string, rows []Row, columns []manifest.Column) error 
 		for _, col := range columns {
 			idx := colIndex[col.Name]
 			val := toParquetValue(row[col.Name], col)
+			// Definition levels: an optional (nullable) leaf allows 0 = null
+			// or 1 = present, while a required leaf only allows 0. So a nil
+			// optional value is encoded at level 0 (true SQL null); every
+			// other case stays at the leaf's only valid level.
 			defLevel := 0
 			if col.Nullable && row[col.Name] != nil {
 				defLevel = 1
@@ -271,4 +294,3 @@ func toString(v any) string {
 		return fmt.Sprintf("%v", val)
 	}
 }
-

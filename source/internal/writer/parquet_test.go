@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/burnside-project/burnside-go/manifest"
+	btypes "github.com/burnside-project/burnside-go/types"
 	goparquet "github.com/parquet-go/parquet-go"
 )
 
@@ -286,5 +287,139 @@ func TestWriteDeltaParquet(t *testing.T) {
 	}
 	if !colNames["id"] {
 		t.Error("missing id column")
+	}
+}
+
+// openTestParquet opens a written parquet file and returns the first row
+// group's rows plus a column-name → parquet column index map.
+func openTestParquet(t *testing.T, path string, wantRows int) (goparquet.Row, map[string]int) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	stat, _ := f.Stat()
+	pf, err := goparquet.OpenFile(f, stat.Size())
+	if err != nil {
+		t.Fatalf("open parquet: %v", err)
+	}
+	if pf.NumRows() != int64(wantRows) {
+		t.Fatalf("rows = %d, want %d", pf.NumRows(), wantRows)
+	}
+
+	idx := map[string]int{}
+	for _, field := range pf.Schema().Fields() {
+		leaf, ok := pf.Schema().Lookup(field.Name())
+		if !ok {
+			t.Fatalf("lookup %s", field.Name())
+		}
+		idx[field.Name()] = leaf.ColumnIndex
+	}
+
+	pqRows := make([]goparquet.Row, wantRows)
+	for i := range pqRows {
+		pqRows[i] = make(goparquet.Row, len(idx))
+	}
+	rg := pf.RowGroups()[0].Rows()
+	n, _ := rg.ReadRows(pqRows)
+	_ = rg.Close()
+	if n != wantRows {
+		t.Fatalf("read %d rows, want %d", n, wantRows)
+	}
+	return pqRows[0], idx
+}
+
+// TestWriteBaseParquet_PersistsTombstoneColumn verifies the base-file contract
+// from btypes.ColDeletedAt: the tombstone column is always present, and a
+// stamped timestamp round-trips while live rows read back as SQL null. Before
+// the fix WriteBaseParquet filtered the column out, so compaction deletes were
+// silently lost on write.
+func TestWriteBaseParquet_PersistsTombstoneColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "public.t", "base", "base_000000.parquet")
+
+	columns := []manifest.Column{
+		{Name: "id", PgType: "bigint", ParquetType: "INT64", Nullable: false},
+		{Name: "label", PgType: "text", ParquetType: "UTF8", Nullable: true},
+	}
+	rows := []Row{
+		{"id": int64(1), "label": "alive"}, // no tombstone
+		{"id": int64(2), "label": "dead", btypes.ColDeletedAt: "2026-11-23T10:00:00Z"},
+	}
+
+	if err := WriteBaseParquet(path, rows, columns); err != nil {
+		t.Fatalf("WriteBaseParquet: %v", err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	stat, _ := f.Stat()
+	pf, err := goparquet.OpenFile(f, stat.Size())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	deletedIdx, ok := pf.Schema().Lookup(btypes.ColDeletedAt)
+	if !ok {
+		t.Fatalf("base file missing %q column — tombstones do not persist", btypes.ColDeletedAt)
+	}
+	if _, hasOp := pf.Schema().Lookup(btypes.ColOp); hasOp {
+		t.Fatalf("delta-only column %q leaked into base schema", btypes.ColOp)
+	}
+
+	pqRows := make([]goparquet.Row, 2)
+	for i := range pqRows {
+		pqRows[i] = make(goparquet.Row, len(pf.Schema().Fields()))
+	}
+	rg := pf.RowGroups()[0].Rows()
+	n, _ := rg.ReadRows(pqRows)
+	_ = rg.Close()
+	if n != 2 {
+		t.Fatalf("read %d rows, want 2", n)
+	}
+
+	col := deletedIdx.ColumnIndex
+	if !pqRows[0][col].IsNull() {
+		t.Errorf("live row tombstone = %v, want null", pqRows[0][col])
+	}
+	if pqRows[1][col].IsNull() {
+		t.Fatalf("deleted row tombstone is null, want stamped timestamp")
+	}
+	if got := string(pqRows[1][col].ByteArray()); got != "2026-11-23T10:00:00Z" {
+		t.Errorf("tombstone value = %q, want stamped RFC3339", got)
+	}
+}
+
+// TestWriteBaseParquet_NullableNullRoundTrips guards the definition-level
+// fix: a nil value in an optional text column must encode as SQL null
+// (definition level 0), not as an empty string. The old code wrote def level 1
+// with a zero-length byte array, so every null optional column read back as ""
+// — which also made live rows appear tombstoned.
+func TestWriteBaseParquet_NullableNullRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "public.n", "base", "base_000000.parquet")
+
+	columns := []manifest.Column{
+		{Name: "id", PgType: "bigint", ParquetType: "INT64", Nullable: false},
+		{Name: "city", PgType: "text", ParquetType: "UTF8", Nullable: true},
+	}
+	rows := []Row{
+		{"id": int64(1), "city": nil},
+		{"id": int64(2), "city": "Portland"},
+	}
+	if err := WriteBaseParquet(path, rows, columns); err != nil {
+		t.Fatalf("WriteBaseParquet: %v", err)
+	}
+
+	first, idx := openTestParquet(t, path, 2)
+	city := first[idx["city"]]
+	if !city.IsNull() {
+		t.Errorf("null optional column read back as %q (def level %d), want SQL null",
+			string(city.ByteArray()), city.DefinitionLevel())
 	}
 }

@@ -12,6 +12,7 @@ import (
 	btypes "github.com/burnside-project/burnside-go/types"
 
 	"github.com/burnside-project/pg-cdc-core/internal/ports"
+	"github.com/burnside-project/pg-cdc-core/internal/rowkey"
 	"github.com/burnside-project/pg-cdc-core/internal/writer"
 
 	goparquet "github.com/parquet-go/parquet-go"
@@ -67,10 +68,18 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 		return fmt.Errorf("no primary key for %s", tableName)
 	}
 
+	// One type-aware identity function, shared by the base index and every
+	// delta row. Building the type map once guarantees both sides resolve the
+	// same logical PK value to the same key.
+	colTypes := rowkey.ColumnTypes(schema.Columns)
+
 	// Index by PK
 	indexed := make(map[string]writer.Row, len(rows))
 	for _, row := range rows {
-		key := pkKey(row, pkCols)
+		key, err := rowkey.Of(row, pkCols, colTypes)
+		if err != nil {
+			return fmt.Errorf("extract base row key: %w", err)
+		}
 		indexed[key] = row
 	}
 
@@ -99,7 +108,10 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 
 		for _, dRow := range deltaRows {
 			op, _ := dRow[btypes.ColOp].(string)
-			key := pkKey(dRow, pkCols)
+			key, err := rowkey.Of(dRow, pkCols, colTypes)
+			if err != nil {
+				return fmt.Errorf("extract delta row key (%s): %w", deltaFile, err)
+			}
 
 			switch op {
 			case "I", "U":
@@ -278,12 +290,4 @@ func parquetValueToGo(v goparquet.Value) any {
 	default:
 		return string(v.ByteArray())
 	}
-}
-
-func pkKey(row writer.Row, pks []string) string {
-	key := ""
-	for _, pk := range pks {
-		key += fmt.Sprintf("%v|", row[pk])
-	}
-	return key
 }
